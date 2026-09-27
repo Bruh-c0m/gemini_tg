@@ -15,6 +15,7 @@ from google.genai import types
 # отдельная часть ответа лучше помещалась в уведомление Telegram.
 TELEGRAM_MESSAGE_LIMIT = 900
 DEFAULT_MODEL = "gemini-3.8-flash"
+NEXT_WORDS = {"дальше", "далее", "продолжить", "next"}
 
 SYSTEM_PROMPT = """
 Ты — эксперт по теоретической физике и квантовой механике. Решай задачу строго,
@@ -101,10 +102,14 @@ def split_message(text: str, limit: int = TELEGRAM_MESSAGE_LIMIT) -> list[str]:
     return chunks
 
 
-async def send_long_answer(message: Message, answer: str) -> None:
-    for chunk in split_message(answer):
-        await message.answer(chunk)
-        await asyncio.sleep(0.15)
+def format_answer_part(chunk: str, index: int, total: int) -> str:
+    if total == 1:
+        return chunk
+
+    text = f"Часть {index + 1} из {total}\n\n{chunk}"
+    if index + 1 < total:
+        text += "\n\nЧтобы получить продолжение, напишите: дальше"
+    return text
 
 
 def make_router(
@@ -114,6 +119,7 @@ def make_router(
     request_gate: asyncio.Semaphore,
 ) -> Router:
     router = Router()
+    pending_answers: dict[int, tuple[list[str], int]] = {}
 
     async def authorize(message: Message) -> bool:
         user_id = message.from_user.id if message.from_user else None
@@ -133,6 +139,36 @@ def make_router(
             )
         return (response.text or "").strip()
 
+    async def send_first_part(message: Message, answer: str) -> None:
+        chunks = split_message(answer)
+        user_id = message.from_user.id if message.from_user else None
+
+        if user_id is not None and len(chunks) > 1:
+            pending_answers[user_id] = (chunks, 1)
+        elif user_id is not None:
+            pending_answers.pop(user_id, None)
+
+        await message.answer(format_answer_part(chunks[0], 0, len(chunks)))
+
+    async def send_next_part(message: Message) -> None:
+        if not await authorize(message):
+            return
+
+        user_id = message.from_user.id if message.from_user else None
+        if user_id is None or user_id not in pending_answers:
+            await message.answer(
+                "Продолжения пока нет. Сначала отправьте новую задачу."
+            )
+            return
+
+        chunks, index = pending_answers[user_id]
+        await message.answer(format_answer_part(chunks[index], index, len(chunks)))
+
+        if index + 1 < len(chunks):
+            pending_answers[user_id] = (chunks, index + 1)
+        else:
+            pending_answers.pop(user_id, None)
+
     async def process_request(message: Message, contents: Iterable[types.Part]) -> None:
         if not await authorize(message):
             return
@@ -144,7 +180,7 @@ def make_router(
                 await status.delete()
             except Exception:
                 logging.warning("Не удалось удалить служебное сообщение", exc_info=True)
-            await send_long_answer(message, answer)
+            await send_first_part(message, answer)
         except Exception:
             logging.exception(
                 "Не удалось обработать запрос пользователя %s",
@@ -165,6 +201,8 @@ def make_router(
         await message.answer(
             "Пришлите фотографию задачи или её текст. Для снимка можно добавить "
             "подпись с уточнением, что именно требуется найти.\n\n"
+            "Длинный ответ приходит частями. Для следующей части напишите "
+            "«дальше» или отправьте /next.\n\n"
             "Команда /id покажет ваш Telegram ID для ограничения доступа."
         )
 
@@ -172,6 +210,10 @@ def make_router(
     async def id_handler(message: Message) -> None:
         user_id = message.from_user.id if message.from_user else "неизвестен"
         await message.answer(f"Ваш Telegram ID: {user_id}")
+
+    @router.message(Command("next"))
+    async def next_handler(message: Message) -> None:
+        await send_next_part(message)
 
     @router.message(F.photo)
     async def photo_handler(message: Message, bot: Bot) -> None:
@@ -228,6 +270,9 @@ def make_router(
     @router.message(F.text)
     async def text_handler(message: Message) -> None:
         if message.text and message.text.startswith("/"):
+            return
+        if (message.text or "").strip().casefold() in NEXT_WORDS:
+            await send_next_part(message)
             return
         await process_request(
             message,

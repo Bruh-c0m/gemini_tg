@@ -1,6 +1,11 @@
 import unittest
 
-from main import TELEGRAM_MESSAGE_LIMIT, parse_allowed_user_ids, split_message
+from main import (
+    TELEGRAM_MESSAGE_LIMIT,
+    format_answer_part,
+    parse_allowed_user_ids,
+    split_message,
+)
 
 
 class SplitMessageTests(unittest.TestCase):
@@ -20,6 +25,15 @@ class SplitMessageTests(unittest.TestCase):
         chunks = split_message("слово " * 1000)
         self.assertEqual(TELEGRAM_MESSAGE_LIMIT, 900)
         self.assertTrue(all(len(chunk) <= 900 for chunk in chunks))
+
+    def test_numbered_part_stays_below_android_limit(self) -> None:
+        part = format_answer_part("а" * TELEGRAM_MESSAGE_LIMIT, 0, 12)
+        self.assertLessEqual(len(part), 1024)
+        self.assertIn("Часть 1 из 12", part)
+        self.assertIn("напишите: дальше", part)
+
+    def test_single_part_has_no_navigation_text(self) -> None:
+        self.assertEqual(format_answer_part("Готово", 0, 1), "Готово")
 
     def test_allowed_user_ids(self) -> None:
         self.assertEqual(parse_allowed_user_ids("10, 20,30"), {10, 20, 30})
