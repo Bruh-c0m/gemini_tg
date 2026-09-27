@@ -8,6 +8,7 @@ from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import Command, CommandStart
 from aiogram.types import Message
 from google import genai
+from google.genai import errors as genai_errors
 from google.genai import types
 
 
@@ -16,6 +17,7 @@ from google.genai import types
 TELEGRAM_MESSAGE_LIMIT = 900
 DEFAULT_MODEL = "gemini-3.8-flash"
 NEXT_WORDS = {"дальше", "далее", "продолжить", "next"}
+GEMINI_RETRY_DELAYS = (2, 4)
 
 SYSTEM_PROMPT = """
 Ты — эксперт по теоретической физике и квантовой механике. Решай задачу строго,
@@ -102,6 +104,15 @@ def split_message(text: str, limit: int = TELEGRAM_MESSAGE_LIMIT) -> list[str]:
     return chunks
 
 
+def is_next_request(text: str) -> bool:
+    normalized = text.strip().casefold()
+    return (
+        normalized in NEXT_WORDS
+        or normalized == "/next"
+        or normalized.startswith("/next@")
+    )
+
+
 def format_answer_part(chunk: str, index: int, total: int) -> str:
     if total == 1:
         return chunk
@@ -129,14 +140,30 @@ def make_router(
         return True
 
     async def ask_gemini(contents: Iterable[types.Part]) -> str:
+        parts = list(contents)
         async with request_gate:
-            response = await ai_client.aio.models.generate_content(
-                model=model_name,
-                contents=list(contents),
-                config=types.GenerateContentConfig(
-                    system_instruction=SYSTEM_PROMPT,
-                ),
-            )
+            for attempt in range(len(GEMINI_RETRY_DELAYS) + 1):
+                try:
+                    response = await ai_client.aio.models.generate_content(
+                        model=model_name,
+                        contents=parts,
+                        config=types.GenerateContentConfig(
+                            system_instruction=SYSTEM_PROMPT,
+                            automatic_function_calling=(
+                                types.AutomaticFunctionCallingConfig(disable=True)
+                            ),
+                        ),
+                    )
+                    break
+                except genai_errors.ServerError as exc:
+                    if exc.code != 503 or attempt >= len(GEMINI_RETRY_DELAYS):
+                        raise
+                    delay = GEMINI_RETRY_DELAYS[attempt]
+                    logging.warning(
+                        "Gemini временно недоступен (503), повтор через %s с",
+                        delay,
+                    )
+                    await asyncio.sleep(delay)
         return (response.text or "").strip()
 
     async def send_first_part(message: Message, answer: str) -> None:
@@ -181,6 +208,21 @@ def make_router(
             except Exception:
                 logging.warning("Не удалось удалить служебное сообщение", exc_info=True)
             await send_first_part(message, answer)
+        except genai_errors.ServerError as exc:
+            logging.exception(
+                "Gemini не обработал запрос пользователя %s",
+                message.from_user.id if message.from_user else "unknown",
+            )
+            error_text = (
+                "Gemini сейчас перегружен. Бот уже повторил запрос несколько раз. "
+                "Попробуйте отправить задачу ещё раз через минуту."
+                if exc.code == 503
+                else "Сервис Gemini временно недоступен. Повторите запрос позже."
+            )
+            try:
+                await status.edit_text(error_text)
+            except Exception:
+                logging.exception("Не удалось обновить служебное сообщение")
         except Exception:
             logging.exception(
                 "Не удалось обработать запрос пользователя %s",
@@ -269,14 +311,15 @@ def make_router(
 
     @router.message(F.text)
     async def text_handler(message: Message) -> None:
-        if message.text and message.text.startswith("/"):
-            return
-        if (message.text or "").strip().casefold() in NEXT_WORDS:
+        text = message.text or ""
+        if is_next_request(text):
             await send_next_part(message)
+            return
+        if text.startswith("/"):
             return
         await process_request(
             message,
-            [types.Part.from_text(text=message.text or "")],
+            [types.Part.from_text(text=text)],
         )
 
     @router.message()

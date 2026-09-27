@@ -3,6 +3,7 @@ import unittest
 from main import (
     TELEGRAM_MESSAGE_LIMIT,
     format_answer_part,
+    is_next_request,
     parse_allowed_user_ids,
     split_message,
 )
@@ -34,6 +35,12 @@ class SplitMessageTests(unittest.TestCase):
 
     def test_single_part_has_no_navigation_text(self) -> None:
         self.assertEqual(format_answer_part("Готово", 0, 1), "Готово")
+
+    def test_next_request_from_watch_without_command_entity(self) -> None:
+        self.assertTrue(is_next_request("/next"))
+        self.assertTrue(is_next_request(" ДАЛЬШЕ "))
+        self.assertTrue(is_next_request("/next@gemini_kvanti_bot"))
+        self.assertFalse(is_next_request("/start"))
 
     def test_allowed_user_ids(self) -> None:
         self.assertEqual(parse_allowed_user_ids("10, 20,30"), {10, 20, 30})
