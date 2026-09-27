@@ -3,6 +3,7 @@ import unittest
 from main import (
     TELEGRAM_MESSAGE_LIMIT,
     format_answer_part,
+    is_back_request,
     is_next_request,
     parse_allowed_user_ids,
     split_message,
@@ -31,7 +32,16 @@ class SplitMessageTests(unittest.TestCase):
         part = format_answer_part("а" * TELEGRAM_MESSAGE_LIMIT, 0, 12)
         self.assertLessEqual(len(part), 1024)
         self.assertIn("Часть 1 из 12", part)
-        self.assertIn("напишите: дальше", part)
+        self.assertTrue(part.endswith("/next"))
+
+    def test_middle_part_has_both_navigation_commands(self) -> None:
+        part = format_answer_part("Текст", 2, 5)
+        self.assertTrue(part.endswith("/back · /next"))
+
+    def test_last_part_keeps_back_command(self) -> None:
+        part = format_answer_part("Ответ", 4, 5)
+        self.assertTrue(part.endswith("/back"))
+        self.assertNotIn("/next", part)
 
     def test_single_part_has_no_navigation_text(self) -> None:
         self.assertEqual(format_answer_part("Готово", 0, 1), "Готово")
@@ -41,6 +51,12 @@ class SplitMessageTests(unittest.TestCase):
         self.assertTrue(is_next_request(" ДАЛЬШЕ "))
         self.assertTrue(is_next_request("/next@gemini_kvanti_bot"))
         self.assertFalse(is_next_request("/start"))
+
+    def test_back_request_from_watch_without_command_entity(self) -> None:
+        self.assertTrue(is_back_request("/back"))
+        self.assertTrue(is_back_request(" НАЗАД "))
+        self.assertTrue(is_back_request("/back@gemini_kvanti_bot"))
+        self.assertFalse(is_back_request("/start"))
 
     def test_allowed_user_ids(self) -> None:
         self.assertEqual(parse_allowed_user_ids("10, 20,30"), {10, 20, 30})

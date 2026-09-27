@@ -17,6 +17,7 @@ from google.genai import types
 TELEGRAM_MESSAGE_LIMIT = 900
 DEFAULT_MODEL = "gemini-3.8-flash"
 NEXT_WORDS = {"дальше", "далее", "продолжить", "next"}
+BACK_WORDS = {"назад", "обратно", "back"}
 GEMINI_RETRY_DELAYS = (2, 4)
 
 SYSTEM_PROMPT = """
@@ -118,13 +119,26 @@ def is_next_request(text: str) -> bool:
     )
 
 
+def is_back_request(text: str) -> bool:
+    normalized = text.strip().casefold()
+    return (
+        normalized in BACK_WORDS
+        or normalized == "/back"
+        or normalized.startswith("/back@")
+    )
+
+
 def format_answer_part(chunk: str, index: int, total: int) -> str:
     if total == 1:
         return chunk
 
     text = f"Часть {index + 1} из {total}\n\n{chunk}"
-    if index + 1 < total:
-        text += "\n\nЧтобы получить продолжение, напишите: дальше"
+    if index == 0:
+        text += "\n\n/next"
+    elif index + 1 == total:
+        text += "\n\n/back"
+    else:
+        text += "\n\n/back · /next"
     return text
 
 
@@ -176,7 +190,7 @@ def make_router(
         user_id = message.from_user.id if message.from_user else None
 
         if user_id is not None and len(chunks) > 1:
-            pending_answers[user_id] = (chunks, 1)
+            pending_answers[user_id] = (chunks, 0)
         elif user_id is not None:
             pending_answers.pop(user_id, None)
 
@@ -193,13 +207,40 @@ def make_router(
             )
             return
 
-        chunks, index = pending_answers[user_id]
-        await message.answer(format_answer_part(chunks[index], index, len(chunks)))
+        chunks, current_index = pending_answers[user_id]
+        next_index = current_index + 1
+        if next_index >= len(chunks):
+            await message.answer("Последняя часть. /back")
+            return
 
-        if index + 1 < len(chunks):
-            pending_answers[user_id] = (chunks, index + 1)
-        else:
-            pending_answers.pop(user_id, None)
+        pending_answers[user_id] = (chunks, next_index)
+        await message.answer(
+            format_answer_part(chunks[next_index], next_index, len(chunks))
+        )
+
+    async def send_previous_part(message: Message) -> None:
+        if not await authorize(message):
+            return
+
+        user_id = message.from_user.id if message.from_user else None
+        if user_id is None or user_id not in pending_answers:
+            await message.answer(
+                "Сохранённого ответа пока нет. Сначала отправьте новую задачу."
+            )
+            return
+
+        chunks, current_index = pending_answers[user_id]
+        previous_index = current_index - 1
+        if previous_index < 0:
+            await message.answer("Первая часть. /next")
+            return
+
+        pending_answers[user_id] = (chunks, previous_index)
+        await message.answer(
+            format_answer_part(
+                chunks[previous_index], previous_index, len(chunks)
+            )
+        )
 
     async def process_request(message: Message, contents: Iterable[types.Part]) -> None:
         if not await authorize(message):
@@ -248,8 +289,7 @@ def make_router(
         await message.answer(
             "Пришлите фотографию задачи или её текст. Для снимка можно добавить "
             "подпись с уточнением, что именно требуется найти.\n\n"
-            "Длинный ответ приходит частями. Для следующей части напишите "
-            "«дальше» или отправьте /next.\n\n"
+            "Навигация по частям: /next — вперёд, /back — назад.\n\n"
             "Команда /id покажет ваш Telegram ID для ограничения доступа."
         )
 
@@ -261,6 +301,10 @@ def make_router(
     @router.message(Command("next"))
     async def next_handler(message: Message) -> None:
         await send_next_part(message)
+
+    @router.message(Command("back"))
+    async def back_handler(message: Message) -> None:
+        await send_previous_part(message)
 
     @router.message(F.photo)
     async def photo_handler(message: Message, bot: Bot) -> None:
@@ -317,6 +361,9 @@ def make_router(
         text = message.text or ""
         if is_next_request(text):
             await send_next_part(message)
+            return
+        if is_back_request(text):
+            await send_previous_part(message)
             return
         if text.startswith("/"):
             return
