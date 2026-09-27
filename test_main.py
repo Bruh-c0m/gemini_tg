@@ -1,6 +1,6 @@
 import unittest
 
-from main import parse_allowed_user_ids, split_message
+from main import TELEGRAM_MESSAGE_LIMIT, parse_allowed_user_ids, split_message
 
 
 class SplitMessageTests(unittest.TestCase):
@@ -15,6 +15,11 @@ class SplitMessageTests(unittest.TestCase):
         chunks = split_message(source, limit=180)
         self.assertTrue(all(len(chunk) <= 180 for chunk in chunks))
         self.assertEqual(" ".join(" ".join(chunks).split()), " ".join(source.split()))
+
+    def test_default_limit_fits_android_notification(self) -> None:
+        chunks = split_message("слово " * 1000)
+        self.assertEqual(TELEGRAM_MESSAGE_LIMIT, 900)
+        self.assertTrue(all(len(chunk) <= 900 for chunk in chunks))
 
     def test_allowed_user_ids(self) -> None:
         self.assertEqual(parse_allowed_user_ids("10, 20,30"), {10, 20, 30})

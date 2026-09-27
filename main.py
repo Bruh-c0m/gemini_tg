@@ -11,7 +11,9 @@ from google import genai
 from google.genai import types
 
 
-TELEGRAM_MESSAGE_LIMIT = 3900
+# Запас относительно системного лимита Android (1024 UTF-16 единицы), чтобы
+# отдельная часть ответа лучше помещалась в уведомление Telegram.
+TELEGRAM_MESSAGE_LIMIT = 900
 DEFAULT_MODEL = "gemini-3.8-flash"
 
 SYSTEM_PROMPT = """
