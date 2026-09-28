@@ -2,7 +2,7 @@ import asyncio
 import io
 import logging
 import os
-from collections.abc import Iterable
+from collections.abc import Awaitable, Callable, Iterable
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import Command, CommandStart
@@ -18,7 +18,9 @@ TELEGRAM_MESSAGE_LIMIT = 900
 DEFAULT_MODEL = "gemini-3.8-flash"
 NEXT_WORDS = {"дальше", "далее", "продолжить", "next"}
 BACK_WORDS = {"назад", "обратно", "back"}
-GEMINI_RETRY_DELAYS = (2, 4)
+GEMINI_RETRY_INITIAL_DELAY = 5
+GEMINI_RETRY_MAX_DELAY = 60
+RETRYABLE_GEMINI_CODES = {429, 500, 502, 503, 504}
 
 SYSTEM_PROMPT = """
 Ты — эксперт по теоретической физике и квантовой механике. Дай краткое, но
@@ -62,22 +64,14 @@ def required_env(name: str) -> str:
     return value
 
 
-def parse_allowed_user_ids(raw: str) -> set[int]:
-    if not raw.strip():
-        return set()
+def gemini_retry_delay(failed_attempt: int) -> int:
+    """Return exponential retry delay capped at one minute."""
+    exponent = max(0, min(failed_attempt - 1, 10))
+    return min(GEMINI_RETRY_INITIAL_DELAY * (2**exponent), GEMINI_RETRY_MAX_DELAY)
 
-    result: set[int] = set()
-    for item in raw.split(","):
-        item = item.strip()
-        if not item:
-            continue
-        try:
-            result.add(int(item))
-        except ValueError as exc:
-            raise RuntimeError(
-                "ALLOWED_USER_IDS должен содержать Telegram ID через запятую"
-            ) from exc
-    return result
+
+def is_retryable_gemini_error(exc: Exception) -> bool:
+    return getattr(exc, "code", None) in RETRYABLE_GEMINI_CODES
 
 
 def split_message(text: str, limit: int = TELEGRAM_MESSAGE_LIMIT) -> list[str]:
@@ -142,48 +136,56 @@ def format_answer_part(chunk: str, index: int, total: int) -> str:
     return text
 
 
+async def ask_gemini_with_retry(
+    ai_client: genai.Client,
+    model_name: str,
+    request_gate: asyncio.Semaphore,
+    contents: Iterable[types.Part],
+    on_retry: Callable[[int, int], Awaitable[None]],
+) -> str:
+    parts = list(contents)
+    failed_attempt = 0
+
+    while True:
+        try:
+            # The semaphore covers only the API call. A request waiting for a
+            # retry must not occupy a slot needed by other users.
+            async with request_gate:
+                response = await ai_client.aio.models.generate_content(
+                    model=model_name,
+                    contents=parts,
+                    config=types.GenerateContentConfig(
+                        system_instruction=SYSTEM_PROMPT,
+                        automatic_function_calling=(
+                            types.AutomaticFunctionCallingConfig(disable=True)
+                        ),
+                    ),
+                )
+            return (response.text or "").strip()
+        except (genai_errors.ClientError, genai_errors.ServerError) as exc:
+            if not is_retryable_gemini_error(exc):
+                raise
+
+            failed_attempt += 1
+            delay = gemini_retry_delay(failed_attempt)
+            logging.warning(
+                "Gemini временно недоступен (HTTP %s), "
+                "автоматический повтор №%s через %s с",
+                exc.code,
+                failed_attempt,
+                delay,
+            )
+            await on_retry(failed_attempt, delay)
+            await asyncio.sleep(delay)
+
+
 def make_router(
     ai_client: genai.Client,
     model_name: str,
-    allowed_user_ids: set[int],
     request_gate: asyncio.Semaphore,
 ) -> Router:
     router = Router()
     pending_answers: dict[int, tuple[list[str], int]] = {}
-
-    async def authorize(message: Message) -> bool:
-        user_id = message.from_user.id if message.from_user else None
-        if allowed_user_ids and user_id not in allowed_user_ids:
-            await message.answer("У этого аккаунта нет доступа к боту.")
-            return False
-        return True
-
-    async def ask_gemini(contents: Iterable[types.Part]) -> str:
-        parts = list(contents)
-        async with request_gate:
-            for attempt in range(len(GEMINI_RETRY_DELAYS) + 1):
-                try:
-                    response = await ai_client.aio.models.generate_content(
-                        model=model_name,
-                        contents=parts,
-                        config=types.GenerateContentConfig(
-                            system_instruction=SYSTEM_PROMPT,
-                            automatic_function_calling=(
-                                types.AutomaticFunctionCallingConfig(disable=True)
-                            ),
-                        ),
-                    )
-                    break
-                except genai_errors.ServerError as exc:
-                    if exc.code != 503 or attempt >= len(GEMINI_RETRY_DELAYS):
-                        raise
-                    delay = GEMINI_RETRY_DELAYS[attempt]
-                    logging.warning(
-                        "Gemini временно недоступен (503), повтор через %s с",
-                        delay,
-                    )
-                    await asyncio.sleep(delay)
-        return (response.text or "").strip()
 
     async def send_first_part(message: Message, answer: str) -> None:
         chunks = split_message(answer)
@@ -197,9 +199,6 @@ def make_router(
         await message.answer(format_answer_part(chunks[0], 0, len(chunks)))
 
     async def send_next_part(message: Message) -> None:
-        if not await authorize(message):
-            return
-
         user_id = message.from_user.id if message.from_user else None
         if user_id is None or user_id not in pending_answers:
             await message.answer(
@@ -219,9 +218,6 @@ def make_router(
         )
 
     async def send_previous_part(message: Message) -> None:
-        if not await authorize(message):
-            return
-
         user_id = message.from_user.id if message.from_user else None
         if user_id is None or user_id not in pending_answers:
             await message.answer(
@@ -243,30 +239,43 @@ def make_router(
         )
 
     async def process_request(message: Message, contents: Iterable[types.Part]) -> None:
-        if not await authorize(message):
-            return
-
         status = await message.answer("Решаю задачу...")
+
+        async def update_retry_status(failed_attempt: int, delay: int) -> None:
+            try:
+                await status.edit_text(
+                    "Gemini сейчас перегружен. Запрос сохранён — "
+                    f"повторяю его автоматически через {delay} с. "
+                    f"Неудачных попыток: {failed_attempt}."
+                )
+            except Exception:
+                logging.warning(
+                    "Не удалось обновить статус повтора", exc_info=True
+                )
+
         try:
-            answer = await ask_gemini(contents)
+            answer = await ask_gemini_with_retry(
+                ai_client=ai_client,
+                model_name=model_name,
+                request_gate=request_gate,
+                contents=contents,
+                on_retry=update_retry_status,
+            )
             try:
                 await status.delete()
             except Exception:
                 logging.warning("Не удалось удалить служебное сообщение", exc_info=True)
             await send_first_part(message, answer)
-        except genai_errors.ServerError as exc:
+        except (genai_errors.ClientError, genai_errors.ServerError):
             logging.exception(
                 "Gemini не обработал запрос пользователя %s",
                 message.from_user.id if message.from_user else "unknown",
             )
-            error_text = (
-                "Gemini сейчас перегружен. Бот уже повторил запрос несколько раз. "
-                "Попробуйте отправить задачу ещё раз через минуту."
-                if exc.code == 503
-                else "Сервис Gemini временно недоступен. Повторите запрос позже."
-            )
             try:
-                await status.edit_text(error_text)
+                await status.edit_text(
+                    "Gemini отклонил запрос. Проверьте API-ключ, "
+                    "доступ к модели и журнал Railway."
+                )
             except Exception:
                 logging.exception("Не удалось обновить служебное сообщение")
         except Exception:
@@ -284,19 +293,12 @@ def make_router(
 
     @router.message(CommandStart())
     async def start_handler(message: Message) -> None:
-        if not await authorize(message):
-            return
         await message.answer(
             "Пришлите фотографию задачи или её текст. Для снимка можно добавить "
             "подпись с уточнением, что именно требуется найти.\n\n"
             "Навигация по частям: /next — вперёд, /back — назад.\n\n"
-            "Команда /id покажет ваш Telegram ID для ограничения доступа."
+            "Если Gemini перегружен, бот сам сохранит и повторит запрос."
         )
-
-    @router.message(Command("id"))
-    async def id_handler(message: Message) -> None:
-        user_id = message.from_user.id if message.from_user else "неизвестен"
-        await message.answer(f"Ваш Telegram ID: {user_id}")
 
     @router.message(Command("next"))
     async def next_handler(message: Message) -> None:
@@ -374,10 +376,9 @@ def make_router(
 
     @router.message()
     async def unsupported_handler(message: Message) -> None:
-        if await authorize(message):
-            await message.answer(
-                "Пришлите текст, фотографию или изображение, отправленное как файл."
-            )
+        await message.answer(
+            "Пришлите текст, фотографию или изображение, отправленное как файл."
+        )
 
     return router
 
@@ -391,13 +392,7 @@ async def main() -> None:
     telegram_token = required_env("TELEGRAM_TOKEN")
     gemini_api_key = required_env("GEMINI_API_KEY")
     model_name = os.getenv("GEMINI_MODEL", DEFAULT_MODEL).strip() or DEFAULT_MODEL
-    allowed_user_ids = parse_allowed_user_ids(os.getenv("ALLOWED_USER_IDS", ""))
-    max_parallel = max(1, int(os.getenv("MAX_PARALLEL_REQUESTS", "2")))
-
-    if not allowed_user_ids:
-        logging.warning(
-            "ALLOWED_USER_IDS не задан: бот будет отвечать всем пользователям"
-        )
+    max_parallel = max(1, int(os.getenv("MAX_PARALLEL_REQUESTS", "4")))
 
     bot = Bot(token=telegram_token)
     dispatcher = Dispatcher()
@@ -406,7 +401,6 @@ async def main() -> None:
         make_router(
             ai_client=ai_client,
             model_name=model_name,
-            allowed_user_ids=allowed_user_ids,
             request_gate=asyncio.Semaphore(max_parallel),
         )
     )
