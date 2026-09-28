@@ -2,7 +2,7 @@ import asyncio
 import io
 import logging
 import os
-from collections.abc import Awaitable, Callable, Iterable
+from collections.abc import Awaitable, Callable, Iterable, Sequence
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import Command, CommandStart
@@ -15,11 +15,11 @@ from google.genai import types
 # Запас относительно системного лимита Android (1024 UTF-16 единицы), чтобы
 # отдельная часть ответа лучше помещалась в уведомление Telegram.
 TELEGRAM_MESSAGE_LIMIT = 900
-DEFAULT_MODEL = "gemini-3.8-flash"
+DEFAULT_MODELS = ("gemini-3.5-flash", "gemini-3.1-flash-lite")
 NEXT_WORDS = {"дальше", "далее", "продолжить", "next"}
 BACK_WORDS = {"назад", "обратно", "back"}
-GEMINI_RETRY_INITIAL_DELAY = 5
-GEMINI_RETRY_MAX_DELAY = 60
+GEMINI_RETRY_INITIAL_DELAY = 3
+GEMINI_RETRY_MAX_DELAY = 30
 RETRYABLE_GEMINI_CODES = {429, 500, 502, 503, 504}
 
 SYSTEM_PROMPT = """
@@ -64,8 +64,14 @@ def required_env(name: str) -> str:
     return value
 
 
+def parse_model_names(raw: str) -> tuple[str, ...]:
+    configured = [item.strip() for item in raw.split(",") if item.strip()]
+    candidates = configured or list(DEFAULT_MODELS)
+    return tuple(dict.fromkeys(candidates))
+
+
 def gemini_retry_delay(failed_attempt: int) -> int:
-    """Return exponential retry delay capped at one minute."""
+    """Return exponential retry delay capped at 30 seconds."""
     exponent = max(0, min(failed_attempt - 1, 10))
     return min(GEMINI_RETRY_INITIAL_DELAY * (2**exponent), GEMINI_RETRY_MAX_DELAY)
 
@@ -138,15 +144,20 @@ def format_answer_part(chunk: str, index: int, total: int) -> str:
 
 async def ask_gemini_with_retry(
     ai_client: genai.Client,
-    model_name: str,
+    model_names: Sequence[str],
     request_gate: asyncio.Semaphore,
     contents: Iterable[types.Part],
-    on_retry: Callable[[int, int], Awaitable[None]],
+    on_retry: Callable[[int, int, str, str], Awaitable[None]],
 ) -> str:
+    if not model_names:
+        raise ValueError("Нужна хотя бы одна модель Gemini")
+
     parts = list(contents)
     failed_attempt = 0
+    model_index = 0
 
     while True:
+        model_name = model_names[model_index]
         try:
             # The semaphore covers only the API call. A request waiting for a
             # retry must not occupy a slot needed by other users.
@@ -168,20 +179,26 @@ async def ask_gemini_with_retry(
 
             failed_attempt += 1
             delay = gemini_retry_delay(failed_attempt)
+            model_index = (model_index + 1) % len(model_names)
+            next_model_name = model_names[model_index]
             logging.warning(
-                "Gemini временно недоступен (HTTP %s), "
-                "автоматический повтор №%s через %s с",
+                "Gemini %s временно недоступен (HTTP %s), "
+                "попытка №%s через %s с; следующая модель — %s",
+                model_name,
                 exc.code,
                 failed_attempt,
                 delay,
+                next_model_name,
             )
-            await on_retry(failed_attempt, delay)
+            await on_retry(
+                failed_attempt, delay, model_name, next_model_name
+            )
             await asyncio.sleep(delay)
 
 
 def make_router(
     ai_client: genai.Client,
-    model_name: str,
+    model_names: Sequence[str],
     request_gate: asyncio.Semaphore,
 ) -> Router:
     router = Router()
@@ -241,11 +258,16 @@ def make_router(
     async def process_request(message: Message, contents: Iterable[types.Part]) -> None:
         status = await message.answer("Решаю задачу...")
 
-        async def update_retry_status(failed_attempt: int, delay: int) -> None:
+        async def update_retry_status(
+            failed_attempt: int,
+            delay: int,
+            _failed_model: str,
+            _next_model: str,
+        ) -> None:
             try:
                 await status.edit_text(
-                    "Gemini сейчас перегружен. Запрос сохранён — "
-                    f"повторяю его автоматически через {delay} с. "
+                    "Gemini сейчас перегружен. Запрос не потерян — "
+                    f"через {delay} с попробую другую модель. "
                     f"Неудачных попыток: {failed_attempt}."
                 )
             except Exception:
@@ -256,7 +278,7 @@ def make_router(
         try:
             answer = await ask_gemini_with_retry(
                 ai_client=ai_client,
-                model_name=model_name,
+                model_names=model_names,
                 request_gate=request_gate,
                 contents=contents,
                 on_retry=update_retry_status,
@@ -391,7 +413,7 @@ async def main() -> None:
 
     telegram_token = required_env("TELEGRAM_TOKEN")
     gemini_api_key = required_env("GEMINI_API_KEY")
-    model_name = os.getenv("GEMINI_MODEL", DEFAULT_MODEL).strip() or DEFAULT_MODEL
+    model_names = parse_model_names(os.getenv("GEMINI_MODELS", ""))
     max_parallel = max(1, int(os.getenv("MAX_PARALLEL_REQUESTS", "4")))
 
     bot = Bot(token=telegram_token)
@@ -400,12 +422,12 @@ async def main() -> None:
     dispatcher.include_router(
         make_router(
             ai_client=ai_client,
-            model_name=model_name,
+            model_names=model_names,
             request_gate=asyncio.Semaphore(max_parallel),
         )
     )
 
-    logging.info("Запуск бота с моделью %s", model_name)
+    logging.info("Запуск бота с моделями %s", ", ".join(model_names))
     try:
         await bot.delete_webhook(drop_pending_updates=False)
         await dispatcher.start_polling(bot)

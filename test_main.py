@@ -13,6 +13,7 @@ from main import (
     gemini_retry_delay,
     is_back_request,
     is_next_request,
+    parse_model_names,
     split_message,
 )
 
@@ -66,10 +67,22 @@ class SplitMessageTests(unittest.TestCase):
         self.assertFalse(is_back_request("/start"))
 
     def test_gemini_retry_delay_grows_and_is_capped(self) -> None:
-        self.assertEqual(gemini_retry_delay(1), 5)
-        self.assertEqual(gemini_retry_delay(2), 10)
-        self.assertEqual(gemini_retry_delay(3), 20)
-        self.assertEqual(gemini_retry_delay(20), 60)
+        self.assertEqual(gemini_retry_delay(1), 3)
+        self.assertEqual(gemini_retry_delay(2), 6)
+        self.assertEqual(gemini_retry_delay(3), 12)
+        self.assertEqual(gemini_retry_delay(20), 30)
+
+    def test_default_models_include_fallback(self) -> None:
+        self.assertEqual(
+            parse_model_names(""),
+            ("gemini-3.5-flash", "gemini-3.1-flash-lite"),
+        )
+
+    def test_configured_models_are_deduplicated(self) -> None:
+        self.assertEqual(
+            parse_model_names("first, second, first"),
+            ("first", "second"),
+        )
 
 
 class GeminiRetryTests(unittest.IsolatedAsyncioTestCase):
@@ -87,16 +100,21 @@ class GeminiRetryTests(unittest.IsolatedAsyncioTestCase):
             )
         )
         request_gate = asyncio.Semaphore(1)
-        retry_calls: list[tuple[int, int]] = []
+        retry_calls: list[tuple[int, int, str, str]] = []
 
-        async def on_retry(attempt: int, delay: int) -> None:
+        async def on_retry(
+            attempt: int,
+            delay: int,
+            failed_model: str,
+            next_model: str,
+        ) -> None:
             self.assertFalse(request_gate.locked())
-            retry_calls.append((attempt, delay))
+            retry_calls.append((attempt, delay, failed_model, next_model))
 
         with patch("main.asyncio.sleep", new=AsyncMock()) as sleep:
             answer = await ask_gemini_with_retry(
                 ai_client=ai_client,
-                model_name="test-model",
+                model_names=("primary-model", "fallback-model"),
                 request_gate=request_gate,
                 contents=[types.Part.from_text(text="Реши задачу")],
                 on_retry=on_retry,
@@ -104,8 +122,22 @@ class GeminiRetryTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(answer, "Готовый ответ")
         self.assertEqual(generate_content.await_count, 3)
-        self.assertEqual(retry_calls, [(1, 5), (2, 10)])
-        self.assertEqual(sleep.await_args_list, [call(5), call(10)])
+        self.assertEqual(
+            retry_calls,
+            [
+                (1, 3, "primary-model", "fallback-model"),
+                (2, 6, "fallback-model", "primary-model"),
+            ],
+        )
+        self.assertEqual(sleep.await_args_list, [call(3), call(6)])
+        used_models = [
+            await_call.kwargs["model"]
+            for await_call in generate_content.await_args_list
+        ]
+        self.assertEqual(
+            used_models,
+            ["primary-model", "fallback-model", "primary-model"],
+        )
 
     async def test_does_not_retry_non_transient_error(self) -> None:
         generate_content = AsyncMock(
@@ -120,7 +152,7 @@ class GeminiRetryTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(genai_errors.ClientError):
             await ask_gemini_with_retry(
                 ai_client=ai_client,
-                model_name="test-model",
+                model_names=("test-model",),
                 request_gate=asyncio.Semaphore(1),
                 contents=[types.Part.from_text(text="test")],
                 on_retry=AsyncMock(),
