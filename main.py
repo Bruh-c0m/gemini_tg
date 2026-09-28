@@ -1,7 +1,9 @@
 import asyncio
+import html
 import io
 import logging
 import os
+import re
 from collections.abc import Awaitable, Callable, Iterable, Sequence
 
 from aiogram import Bot, Dispatcher, F, Router
@@ -28,7 +30,8 @@ SYSTEM_PROMPT = """
 угадывай: кратко перечисли, что нужно уточнить.
 
 Требования к решению:
-1. Не переписывай условие и список «дано», если без этого понятны обозначения.
+1. Для каждой задачи одной строкой напиши, что именно требуется найти. Обязательно
+   сохрани все интервалы, номера уровней, координаты и числовые данные из условия.
 2. Сразу определи физическую модель и запиши исходное уравнение.
 3. Покажи только преобразования, необходимые для получения ответа. Не выводи
    заново общеизвестные формулы, но укажи граничные условия и нормировку, если
@@ -36,7 +39,9 @@ SYSTEM_PROMPT = """
 4. Не добавляй исторические справки, длинный физический комментарий, формулу
    Родрига, отдельный анализ размерностей или предельных случаев, если в них
    нет необходимости для проверки именно этой задачи.
-5. Заверши блоком «Ответ» с искомыми формулами и диапазоном квантовых чисел.
+5. Заверши каждую задачу отдельной строкой «ОТВЕТ: ...». Подставь все заданные
+   числа и единицы измерения; не оставляй только общую формулу, если возможен
+   численный результат.
 6. Не повторяй в конце формулы, уже явно выделенные как окончательный ответ.
 7. Для одной стандартной задачи ориентируйся примерно на 900–1500 символов,
    но это не ограничение. Если задач несколько, реши каждую из них отдельно и
@@ -45,6 +50,8 @@ SYSTEM_PROMPT = """
 
 Формат для Telegram и часов:
 - Пиши по-русски, обычным текстом, короткими абзацами.
+- Каждую задачу начинай с отдельной строки «ЗАДАЧА 1», «ЗАДАЧА 1.1» и т. п.
+- Не объединяй решения разных пунктов. Между задачами оставляй пустую строку.
 - Не используй Markdown-таблицы, кодовые блоки и сырой LaTeX вроде \\frac,
   \\sqrt, $$ или \\psi.
 - Используй читаемые Unicode-символы: ψ, Ψ, φ, ℏ, ∂, ∫, Σ, ∇, √, ∞, ±, ×,
@@ -52,9 +59,35 @@ SYSTEM_PROMPT = """
 - Формулы записывай линейно и каждую важную формулу помещай на отдельную строку.
 - Дроби и степени пиши понятно, например:
   (-ℏ² / 2m) · d²ψ/dx² + V(x)ψ = Eψ.
-- Используй короткие заголовки: «Решение», «Ответ». Не создавай многочисленные
+- Используй короткие заголовки: «РЕШЕНИЕ», «ОТВЕТ». Не создавай многочисленные
   нумерованные разделы.
+
+Обязательная проверка перед отправкой ответа:
+- каждый найденный ответ относится именно к величине, которую спрашивают;
+- «плотность вероятности», «вероятность на интервале» и «математическое ожидание»
+  не перепутаны;
+- все указанные в условии границы интервала реально использованы в интеграле;
+- если математическое ожидание запрошено только на части области и формулировка
+  допускает два смысла, приведи отдельно интеграл по интервалу и условное среднее;
+- численные данные подставлены, арифметика и размерность проверены;
+- ни один пункт билета не пропущен.
 """.strip()
+
+PHOTO_PROMPT = """
+Реши билет строго по прикреплённой фотографии.
+
+Сначала внимательно считай номер варианта и все пункты. Внутренне сверь каждую
+формулу, индекс, степень, координату, границу интервала и числовое значение с
+изображением. Решай только те задачи, которые действительно видны на фото.
+Не заменяй их похожими типовыми задачами. Если отдельный символ не читается,
+укажи сомнение вместо догадки.
+""".strip()
+
+HEADING_PATTERN = re.compile(
+    r"^(?:Часть\s+\d+\s+из\s+\d+|ЗАДАЧА(?:\s+\d+(?:\.\d+)?)?|"
+    r"РЕШЕНИЕ|ОТВЕТ(?::.*)?|РАСПОЗНАНО(?::.*)?)$",
+    re.IGNORECASE,
+)
 
 
 def required_env(name: str) -> str:
@@ -142,6 +175,17 @@ def format_answer_part(chunk: str, index: int, total: int) -> str:
     return text
 
 
+def format_telegram_html(text: str) -> str:
+    """Escape model output and emphasize only predictable structural lines."""
+    rendered_lines: list[str] = []
+    for line in text.splitlines():
+        escaped = html.escape(line)
+        if HEADING_PATTERN.fullmatch(line.strip()):
+            escaped = f"<b>{escaped}</b>"
+        rendered_lines.append(escaped)
+    return "\n".join(rendered_lines)
+
+
 async def ask_gemini_with_retry(
     ai_client: genai.Client,
     model_names: Sequence[str],
@@ -213,7 +257,12 @@ def make_router(
         elif user_id is not None:
             pending_answers.pop(user_id, None)
 
-        await message.answer(format_answer_part(chunks[0], 0, len(chunks)))
+        await message.answer(
+            format_telegram_html(
+                format_answer_part(chunks[0], 0, len(chunks))
+            ),
+            parse_mode="HTML",
+        )
 
     async def send_next_part(message: Message) -> None:
         user_id = message.from_user.id if message.from_user else None
@@ -231,7 +280,10 @@ def make_router(
 
         pending_answers[user_id] = (chunks, next_index)
         await message.answer(
-            format_answer_part(chunks[next_index], next_index, len(chunks))
+            format_telegram_html(
+                format_answer_part(chunks[next_index], next_index, len(chunks))
+            ),
+            parse_mode="HTML",
         )
 
     async def send_previous_part(message: Message) -> None:
@@ -250,9 +302,12 @@ def make_router(
 
         pending_answers[user_id] = (chunks, previous_index)
         await message.answer(
-            format_answer_part(
-                chunks[previous_index], previous_index, len(chunks)
-            )
+            format_telegram_html(
+                format_answer_part(
+                    chunks[previous_index], previous_index, len(chunks)
+                )
+            ),
+            parse_mode="HTML",
         )
 
     async def process_request(message: Message, contents: Iterable[types.Part]) -> None:
@@ -340,9 +395,9 @@ def make_router(
 
         buffer = io.BytesIO()
         await bot.download_file(telegram_file.file_path, destination=buffer)
-        prompt = message.caption or (
-            "Распознай условие на фотографии и дай краткое, но полное решение."
-        )
+        prompt = PHOTO_PROMPT
+        if message.caption:
+            prompt += f"\n\nКомментарий пользователя: {message.caption}"
         await process_request(
             message,
             [
@@ -369,9 +424,9 @@ def make_router(
 
         buffer = io.BytesIO()
         await bot.download_file(telegram_file.file_path, destination=buffer)
-        prompt = message.caption or (
-            "Распознай условие на изображении и дай краткое, но полное решение."
-        )
+        prompt = PHOTO_PROMPT
+        if message.caption:
+            prompt += f"\n\nКомментарий пользователя: {message.caption}"
         await process_request(
             message,
             [

@@ -10,6 +10,7 @@ from main import (
     TELEGRAM_MESSAGE_LIMIT,
     ask_gemini_with_retry,
     format_answer_part,
+    format_telegram_html,
     gemini_retry_delay,
     is_back_request,
     is_next_request,
@@ -53,6 +54,15 @@ class SplitMessageTests(unittest.TestCase):
 
     def test_single_part_has_no_navigation_text(self) -> None:
         self.assertEqual(format_answer_part("Готово", 0, 1), "Готово")
+
+    def test_telegram_html_escapes_formulas_and_bolds_headings(self) -> None:
+        rendered = format_telegram_html(
+            "ЗАДАЧА 3\n\nРЕШЕНИЕ\n0 < x < L\n\nОТВЕТ: ⟨x⟩ = L/2"
+        )
+        self.assertIn("<b>ЗАДАЧА 3</b>", rendered)
+        self.assertIn("<b>РЕШЕНИЕ</b>", rendered)
+        self.assertIn("0 &lt; x &lt; L", rendered)
+        self.assertIn("<b>ОТВЕТ: ⟨x⟩ = L/2</b>", rendered)
 
     def test_next_request_from_watch_without_command_entity(self) -> None:
         self.assertTrue(is_next_request("/next"))
