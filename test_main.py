@@ -32,6 +32,35 @@ class SplitMessageTests(unittest.TestCase):
         self.assertTrue(all(len(chunk) <= 180 for chunk in chunks))
         self.assertEqual(" ".join(" ".join(chunks).split()), " ".join(source.split()))
 
+    def test_new_task_is_not_left_at_end_of_previous_part(self) -> None:
+        task_1 = "ЗАДАЧА 1\n\n" + "Первое решение. " * 5
+        task_2 = "ЗАДАЧА 2\n\n" + "Второе решение. " * 5
+
+        chunks = split_message(f"{task_1}\n\n{task_2}", limit=120)
+
+        self.assertEqual(len(chunks), 2)
+        self.assertTrue(chunks[0].startswith("ЗАДАЧА 1"))
+        self.assertNotIn("ЗАДАЧА 2", chunks[0])
+        self.assertTrue(chunks[1].startswith("ЗАДАЧА 2"))
+
+    def test_long_task_continuations_repeat_task_heading(self) -> None:
+        source = (
+            "ЗАДАЧА 3\n\n"
+            + "Требуется найти математическое ожидание.\n\n"
+            + "РЕШЕНИЕ\n"
+            + "Формула и вычисления. " * 12
+            + "\n\nОТВЕТ: значение."
+        )
+
+        chunks = split_message(source, limit=150)
+
+        self.assertGreater(len(chunks), 1)
+        self.assertTrue(all(chunk.startswith("ЗАДАЧА 3") for chunk in chunks))
+        self.assertTrue(
+            all("ПРОДОЛЖЕНИЕ" in chunk for chunk in chunks[1:])
+        )
+        self.assertTrue(all(len(chunk) <= 150 for chunk in chunks))
+
     def test_default_limit_fits_android_notification(self) -> None:
         chunks = split_message("слово " * 1000)
         self.assertEqual(TELEGRAM_MESSAGE_LIMIT, 900)
@@ -63,6 +92,10 @@ class SplitMessageTests(unittest.TestCase):
         self.assertIn("<b>РЕШЕНИЕ</b>", rendered)
         self.assertIn("0 &lt; x &lt; L", rendered)
         self.assertIn("<b>ОТВЕТ: ⟨x⟩ = L/2</b>", rendered)
+        self.assertEqual(
+            format_telegram_html("ЗАДАЧА 3 — ПРОДОЛЖЕНИЕ"),
+            "<b>ЗАДАЧА 3 — ПРОДОЛЖЕНИЕ</b>",
+        )
 
     def test_next_request_from_watch_without_command_entity(self) -> None:
         self.assertTrue(is_next_request("/next"))

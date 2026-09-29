@@ -84,9 +84,13 @@ PHOTO_PROMPT = """
 """.strip()
 
 HEADING_PATTERN = re.compile(
-    r"^(?:Часть\s+\d+\s+из\s+\d+|ЗАДАЧА(?:\s+\d+(?:\.\d+)?)?|"
+    r"^(?:Часть\s+\d+\s+из\s+\d+|"
+    r"ЗАДАЧА(?:\s+\d+(?:\.\d+)?(?:\s+—\s+ПРОДОЛЖЕНИЕ)?)?|"
     r"РЕШЕНИЕ|ОТВЕТ(?::.*)?|РАСПОЗНАНО(?::.*)?)$",
     re.IGNORECASE,
+)
+TASK_START_PATTERN = re.compile(
+    r"(?im)^ЗАДАЧА\s+\d+(?:\.\d+)?[^\n]*$"
 )
 
 
@@ -113,12 +117,9 @@ def is_retryable_gemini_error(exc: Exception) -> bool:
     return getattr(exc, "code", None) in RETRYABLE_GEMINI_CODES
 
 
-def split_message(text: str, limit: int = TELEGRAM_MESSAGE_LIMIT) -> list[str]:
-    """Split text without losing characters, preferring paragraph boundaries."""
+def _split_plain_text(text: str, limit: int) -> list[str]:
+    """Split one text block, preferring paragraphs and complete sentences."""
     remainder = text.strip()
-    if not remainder:
-        return ["Модель не вернула текстовый ответ."]
-
     chunks: list[str] = []
     while len(remainder) > limit:
         candidates = (
@@ -140,6 +141,89 @@ def split_message(text: str, limit: int = TELEGRAM_MESSAGE_LIMIT) -> list[str]:
 
     if remainder:
         chunks.append(remainder)
+    return chunks
+
+
+def _split_long_task(section: str, limit: int) -> list[str]:
+    """Split an oversized task and repeat its number in every continuation."""
+    heading, _, body = section.strip().partition("\n")
+    continuation_heading = f"{heading} — ПРОДОЛЖЕНИЕ"
+    paragraphs = [
+        paragraph.strip()
+        for paragraph in re.split(r"\n\s*\n", body.strip())
+        if paragraph.strip()
+    ]
+
+    chunks: list[str] = []
+    current = heading
+    for paragraph in paragraphs:
+        candidate = f"{current}\n\n{paragraph}"
+        if len(candidate) <= limit:
+            current = candidate
+            continue
+
+        if current != heading:
+            chunks.append(current)
+            current = continuation_heading
+
+        available = limit - len(current) - 2
+        if len(paragraph) <= available:
+            current = f"{current}\n\n{paragraph}"
+            continue
+
+        for part in _split_plain_text(paragraph, available):
+            chunks.append(f"{current}\n\n{part}")
+            current = continuation_heading
+
+    if current not in {heading, continuation_heading}:
+        chunks.append(current)
+    elif not chunks:
+        chunks.append(heading)
+    return chunks
+
+
+def split_message(text: str, limit: int = TELEGRAM_MESSAGE_LIMIT) -> list[str]:
+    """Split answers without leaving the start of a task in the previous part."""
+    source = text.strip()
+    if not source:
+        return ["Модель не вернула текстовый ответ."]
+
+    task_matches = list(TASK_START_PATTERN.finditer(source))
+    if not task_matches:
+        return _split_plain_text(source, limit)
+
+    sections: list[str] = []
+    preamble = source[: task_matches[0].start()].strip()
+    if preamble:
+        sections.append(preamble)
+    for index, match in enumerate(task_matches):
+        end = (
+            task_matches[index + 1].start()
+            if index + 1 < len(task_matches)
+            else len(source)
+        )
+        sections.append(source[match.start() : end].strip())
+
+    chunks: list[str] = []
+    current = ""
+    for section in sections:
+        if len(section) > limit:
+            if current:
+                chunks.append(current)
+                current = ""
+            chunks.extend(_split_long_task(section, limit))
+            continue
+
+        candidate = f"{current}\n\n{section}" if current else section
+        if len(candidate) <= limit:
+            current = candidate
+        else:
+            if current:
+                chunks.append(current)
+            current = section
+
+    if current:
+        chunks.append(current)
     return chunks
 
 
